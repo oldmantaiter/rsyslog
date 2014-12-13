@@ -1469,6 +1469,22 @@ AM_CONDITIONAL(ENABLE_OMHIREDIS, test x$enable_omhiredis = xyes)
 
 # END HIREDIS SUPPORT
 
+# BEGIN KAFKA OUTPUT SUPPORT
+AC_ARG_ENABLE(omkafka,
+        [AS_HELP_STRING([--enable-omkafka],[Compiles omkafka output module @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_omkafka="yes" ;;
+          no) enable_omkafka="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-omkafka) ;;
+         esac],
+        [enable_omkafka=no]
+)
+if test "x$enable_omkafka" = "xyes"; then
+   AC_CHECK_HEADERS([librdkafka/rdkafka.h])
+fi
+AM_CONDITIONAL(ENABLE_OMKAFKA, test x$enable_omkafka = xyes)
+
+# END KAFKA SUPPORT
 
 AC_CHECKING([if required man pages already exist])
 have_to_generate_man_pages="no"
@@ -1570,6 +1586,7 @@ AC_CONFIG_FILES([Makefile \
 		contrib/omczmq/Makefile \
 		contrib/imzmq3/Makefile \
 		contrib/imczmq/Makefile \
+		contrib/omkafka/Makefile \
 		contrib/mmsequence/Makefile \
 		contrib/mmrfc5424addhmac/Makefile \
 		contrib/pmcisconames/Makefile \
@@ -1620,6 +1637,7 @@ echo "    omuxsock module will be compiled:         $enable_omuxsock"
 echo "    omzmq3 module will be compiled:           $enable_omzmq3"
 echo "    omczmq module will be compiled:           $enable_omczmq"
 echo "    omrabbitmq module will be compiled:       $enable_omrabbitmq"
+echo "    omkafka module will be compiled:          $enable_omkafka"
 echo
 echo "---{ parser modules }---"
 echo "    pmlastmsg module will be compiled:        $enable_pmlastmsg"

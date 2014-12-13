@@ -180,6 +180,10 @@ if ENABLE_IMCZMQ
 SUBDIRS += contrib/imczmq
 endif
 
+if ENABLE_OMKAFKA
+SUBDIRS += contrib/omkafka
+endif
+
 if ENABLE_OMUXSOCK
 SUBDIRS += plugins/omuxsock
 endif

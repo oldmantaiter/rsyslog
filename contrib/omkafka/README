@@ -1,0 +1,38 @@
+Kafka 0.8 Output Plugin
+
+Building this plugin:
+Requires librdkafka, download and install from https://github.com/edenhill/librdkafka.
+
+Omkafka pushes data out of rsyslog into a kafka cluster, the topic can be templated
+as well as the message that will be inserted into the log.
+
+This module will output statistics as well; both how many messages it has submitted
+and how many have failed.
+
+This plugin requires the v6 format.
+
+Example configuration:
+-------------------------------------------------------------------------------
+module(load="imudp")
+module(load="omkafka")
+module(load="impstats"
+       interval="5"
+       severity="7")
+syslog.=debug /var/log/testingstats
+template(name="testmsg" type="string" string="%syslogtag%:%msg%")
+template(name="testtopic" type="string" string="%programname%")
+ruleset(name="kafkatesting"){
+    action(type="omkafka"
+           brokers="kafka-broker01:9092"
+           topic="testtopic"
+           dyntopic="on"
+           template="testmsg"
+           )
+}
+input(type="imudp" port="9999" ruleset="kafkatesting")
+-------------------------------------------------------------------------------
+
+The above example, binds to UDP port 9999 and will forward all messages
+to kafka using the %programname% property and the messages will be
+"%syslogtag%:%msg%". It will also output the stats every 5 seconds so you
+can watch those messages fly through.
