@@ -722,6 +722,29 @@ AM_CONDITIONAL(ENABLE_SNMP, test x$enable_snmp = xyes)
 AC_SUBST(SNMP_CFLAGS)
 AC_SUBST(SNMP_LIBS)
 
+# KAFKA support
+AC_ARG_ENABLE(kafka,
+        [AS_HELP_STRING([--enable-kafka],[Enable Kafka support @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_kafka="yes" ;;
+          no) enable_kafka="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-kafka) ;;
+         esac],
+        [enable_kafka=no]
+)
+if test "x$enable_kafka" = "xyes"; then
+  AC_CHECK_HEADERS(
+    [librdkafka/rdkafka.h],,
+    [AC_MSG_FAILURE([librdkafka is missing])]
+  )
+  AC_CHECK_LIB(
+    [rdkafka],
+    [AC_MSG_FAILURE([librdkafka library is missing])]
+  )
+fi
+AM_CONDITIONAL(ENABLE_KAFKA, test x$enable_kafka = xyes)
+AC_SUBST(KAFKA_CFLAGS)
+AC_SUBST(KAFKA_LIBS)
 
 # uuid support
 AC_ARG_ENABLE(uuid,
@@ -1470,6 +1493,7 @@ AC_CONFIG_FILES([Makefile \
 		plugins/omlibdbi/Makefile \
 		plugins/ommail/Makefile \
 		plugins/omsnmp/Makefile \
+		plugins/omkafka/Makefile \
 		plugins/omoracle/Makefile \
 		plugins/omudpspoof/Makefile \
 		plugins/ommongodb/Makefile \
@@ -1528,6 +1552,7 @@ echo "    omudpspoof module will be compiled:       $enable_omudpspoof"
 echo "    omuxsock module will be compiled:         $enable_omuxsock"
 echo "    omzmq3 module will be compiled:           $enable_omzmq3"
 echo "    omrabbitmq module will be compiled:       $enable_omrabbitmq"
+echo "    omkafka module will be compiled:          $enable_kafka"
 echo
 echo "---{ parser modules }---"
 echo "    pmrfc3164sd module will be compiled:      $enable_pmrfc3164sd"

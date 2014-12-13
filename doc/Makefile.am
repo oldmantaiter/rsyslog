@@ -42,6 +42,7 @@ html_files = \
 	omudpspoof.html \
 	omruleset.html \
 	omsnmp.html \
+	omkafka.html \
 	sigprov_gt.html \
 	ommysql.html \
 	omoracle.html \

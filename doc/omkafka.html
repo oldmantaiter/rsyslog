@@ -1,0 +1,74 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html><head>
+<meta http-equiv="Content-Language" content="en">
+<title>Kafka Output Module</title></head>
+
+<body>
+<a href="rsyslog_conf_modules.html">back</a>
+
+<h1>Kafka Output Module</h1>
+<p><b>Module Name:&nbsp;&nbsp;&nbsp; omkafka</b></p>
+<p><b>Author:</b> Tait Clarridge &lt;tait@clarridge.ca&gt;</p>
+<p><b>Description</b>:</p>
+<p>Provides the ability to send syslog messages to a Kafka cluster. 
+This module uses the <a target="_blank" href="https://github.com/edenhill/librdkafka">
+librdkafka</a> library. In order to compile this module, you will need to have the
+<a target="_blank" href="https://github.com/edenhill/librdkafka">librdkafka</a> 
+developer (headers) package installed. </p>
+<p><b>Action Parameters</b>:</p>
+<ul>
+    <li>
+        <b>brokers</b><br />
+        Hostname or comma-separated list of Kafka brokers with their ports (eg. kafka-broker01:9092)</li>
+    <li>
+        <b>topic</b><br />
+        Kafka topic to insert messages into</li>
+    <li>
+        <b>dyntopic</b>&lt;on/<b>off</b>&gt;<br />
+        Whether the string provided for <strong>topic</strong> should be taken as a <a href="http://www.rsyslog.com/doc/rsyslog_conf_templates.html">template</a>. Defaults to &quot;off&quot;, which means the topic name will be taken literally. Otherwise, it will look for a template with that name, and the resulting string will be the topic name.</li>
+    <li>
+        <b>template</b><br />
+        The format in which the log line will be written into Kafka</li>
+    <li>
+        <b>key</b><br />
+        Partition key for Kafka</li>
+    <li>
+        <b>partition</b><br />
+        Partition number to insert to</li>
+    <li>
+        <b>acks</b><br />
+        Currently not implemented - Number of acks to wait for from the broker before moving on. Corresponds to Kafka configuration option &quot;request.required.acks&quot;</li>
+    <li>
+        <b>maxbuffmsgs</b><br />
+        Kafka queue buffering max limit. Corresponds to Kafka configuration option &quot;queue.buffering.max.messages&quot;. Defaults to 500000.</li>
+    <li>
+        <b>maxretries</b><br />
+        Kafka message retry max limit. Corresponds to Kafka configuration option &quot;message.send.max.retries&quot;. Defaults to 3.</li>
+    <li>
+        <b>retrybackoffms</b><br />
+        Time in ms for retries.. Corresponds to Kafka configuration option &quot;retry.backoff.ms&quot;. Defaults to 500.</li>
+</ul>
+<p><b>Samples:</b></p>
+<p>The following sample does the following:</p>
+<ul>
+    <li>loads the omkafka module</li>
+    <li>outputs all logs to a Kafka cluster at localhost:9092</li>
+    <li>uses template variable programname for the topic</li>
+</ul>
+<pre>
+module(load=&quot;omkafka&quot;)
+template(name=&quot;testtopic&quot; type=&quot;string&quot; string=&quot;%programname%&quot;)
+*.*     action(type=&quot;omkafka&quot;
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;brokers=&quot;localhost:9092&quot;
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;topic=&quot;testtopic&quot;
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;dyntopic=&quot;on&quot;
+)</pre>
+<p>[<a href="rsyslog_conf.html">rsyslog.conf overview</a>] [<a href="manual.html">manual 
+index</a>] [<a href="http://www.rsyslog.com/">rsyslog site</a>]</p>
+<p><font size="2">This documentation is part of the
+<a href="http://www.rsyslog.com/">rsyslog</a> project.<br>
+Copyright © 2008 by <a href="http://www.gerhards.net/rainer">Rainer Gerhards</a> and
+<a href="http://www.adiscon.com/">Adiscon</a>. Released under the GNU GPL 
+version 3 or higher.</font></p>
+
+</body></html>

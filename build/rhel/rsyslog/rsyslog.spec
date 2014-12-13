@@ -136,6 +136,13 @@ Group: System Environment/Daemons
 Requires: %name = %version-%release
 BuildRequires: net-snmp-devel
 
+%package kafka
+Summary: Kafka support for rsyslog
+Group: System Environment/Daemons
+Requires: %name = %version-%release
+BuildRequires: librdkafka-devel
+Requires: librdkafka
+
 %package udpspoof
 Summary: Provides the omudpspoof module
 Group: System Environment/Daemons
@@ -199,6 +206,10 @@ IETF standard protocol.
 The rsyslog-snmp package contains the rsyslog plugin that provides the
 ability to send syslog messages as SNMPv1 and SNMPv2c traps.
 
+%description kafka
+The rsyslog-kafka package contains the rsyslog plugin that provides the
+ability to send syslog messages to a kafka cluster.
+
 %description udpspoof
 This module is similar to the regular UDP forwarder, but permits to
 spoof the sender address. Also, it enables to circle through a number
@@ -245,6 +256,7 @@ export PKG_CONFIG=/usr/bin/pkg-config
         --enable-pmlastmsg \
         --enable-relp \
         --enable-snmp \
+        --enable-kafka \
         --enable-unlimited-select
 make
 
@@ -387,6 +399,10 @@ fi
 %files snmp
 %defattr(-,root,root)
 %{_libdir}/rsyslog/omsnmp.so
+
+%files kafka
+%defattr(-,root,root)
+%{_libdir}/rsyslog/omkafka.so
 
 %files udpspoof
 %defattr(-,root,root)

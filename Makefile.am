@@ -117,6 +117,10 @@ if ENABLE_SNMP
 SUBDIRS += plugins/omsnmp
 endif
 
+if ENABLE_KAFKA
+SUBDIRS += plugins/omkafka
+endif
+
 if ENABLE_SMCUSTBINDCDR
 SUBDIRS += plugins/sm_cust_bindcdr
 endif
@@ -275,6 +279,7 @@ DISTCHECK_CONFIGURE_FLAGS=	--enable-gssapi_krb5 \
 				--enable-pmlastmsg \
 				--enable-omruleset \
 				--enable-omprog \
+				--enable-kafka \
 				--enable-imdiag \
 				--enable-imptcp \
 				--enable-imttcp \
