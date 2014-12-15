@@ -38,6 +38,10 @@
 #include "module-template.h"
 #include "errmsg.h"
 #include "atomic.h"
+#include "statsobj.h"
+#include "hashtable.h"
+#include "hashtable_itr.h"
+#include "unicode-helper.h"
 
 MODULE_TYPE_OUTPUT
 MODULE_TYPE_NOKEEP
@@ -47,6 +51,11 @@ MODULE_CNFNAME("omkafka")
  */
 DEF_OMOD_STATIC_DATA
 DEFobjCurrIf(errmsg)
+DEFobjCurrIf(statsobj)
+
+statsobj_t *kafkaStats;
+STATSCOUNTER_DEF(topicSubmit, mutCtrTopicSubmit)
+STATSCOUNTER_DEF(kafkaFail, mutCtrKafkaFail)
 
 #define MAX_ERRMSG 1024 /* max size of error messages that we support */
 
@@ -58,7 +67,8 @@ struct kafka_params {
 };
 
 typedef struct _instanceData {
-	char *topic;
+	uchar *topic;
+	sbool dynTopic;
 	uchar *tplName;		/* assigned output template */
 	char *brokers;
 	int fixedPartition;
@@ -70,15 +80,15 @@ typedef struct _instanceData {
 	struct kafka_params *topicConfParams;
 	uchar *errorFile;
 	int fdErrFile;		/* error file fd or -1 if not open */
+	struct hashtable *topics;
 	pthread_mutex_t mutErrFile;
+	int bIsOpen;
+	rd_kafka_t *rk;
 } instanceData;
 
 typedef struct wrkrInstanceData {
 	instanceData *pData;
-	int bIsOpen;
 	int bReportErrs;
-	rd_kafka_t *rk;
-	rd_kafka_topic_t *rkt;
 } wrkrInstanceData_t;
 
 
@@ -86,6 +96,7 @@ typedef struct wrkrInstanceData {
 /* action (instance) parameters */
 static struct cnfparamdescr actpdescr[] = {
 	{ "topic", eCmdHdlrString, CNFPARAM_REQUIRED },
+	{ "dyntopic", eCmdHdlrBinary, 0 },
 	{ "partitions.number", eCmdHdlrPositiveInt, 0 },
 	{ "partitions.usefixed", eCmdHdlrNonNegInt, 0 }, /* expert parameter, "nails" partition */
 	{ "broker", eCmdHdlrArray, 0 },
@@ -114,6 +125,8 @@ getPartition(instanceData *const __restrict__ pData)
 }
 
 BEGINdoHUP
+	rd_kafka_topic_t *rkt;
+	struct hashtable_itr *itr;
 CODESTARTdoHUP
 	pthread_mutex_lock(&pData->mutErrFile);
 	if(pData->fdErrFile != -1) {
@@ -121,6 +134,16 @@ CODESTARTdoHUP
 		pData->fdErrFile = -1;
 	}
 	pthread_mutex_unlock(&pData->mutErrFile);
+	/* Iterate through hashtable and remove objects */
+	itr = hashtable_iterator(pData->topics);
+	if(hashtable_count(pData->topics) > 0)
+	{
+		do {
+			rkt = (rd_kafka_topic_t *) hashtable_iterator_value(itr);
+			rd_kafka_topic_destroy(rkt);
+			DBGPRINTF("omkafka: HUP, closing topic %s\n", rd_kafka_topic_name(rkt));
+		} while (hashtable_iterator_remove(itr));
+	}
 ENDdoHUP
 
 
@@ -215,8 +238,12 @@ kafkaLogger(const rd_kafka_t __attribute__((unused)) *rk, int level,
 static inline void
 do_rd_kafka_destroy(wrkrInstanceData_t *const __restrict pWrkrData)
 {
-	rd_kafka_destroy(pWrkrData->rk);
-	pWrkrData->rk = NULL;
+	DBGPRINTF("omkafka: closing - items left in outqueue: %d\n",
+		  rd_kafka_outq_len(pWrkrData->pData->rk));
+	while (rd_kafka_outq_len(pWrkrData->pData->rk) > 0)
+		rd_kafka_poll(pWrkrData->pData->rk, 10);
+	rd_kafka_destroy(pWrkrData->pData->rk);
+	pWrkrData->pData->rk = NULL;
 }
 
 
@@ -224,10 +251,10 @@ static rsRetVal
 closeKafka(wrkrInstanceData_t *const __restrict__ pWrkrData)
 {
 	DEFiRet;
-	if(!pWrkrData->bIsOpen)
+	if(!pWrkrData->pData->bIsOpen)
 		FINALIZE;
 	do_rd_kafka_destroy(pWrkrData);
-	pWrkrData->bIsOpen = 0;
+	pWrkrData->pData->bIsOpen = 0;
 finalize_it:
 	RETiRet;
 }
@@ -240,6 +267,15 @@ errorCallback(rd_kafka_t __attribute__((unused)) *rk,
 {
 	errmsg.LogError(0, RS_RET_KAFKA_ERROR,
 		"omkafka: kafka message %s", reason);
+}
+
+/* destroy hashtable item */
+static void
+topicHashDestruct(void *ptr)
+{
+	rd_kafka_topic_t *rkt = (rd_kafka_topic_t*) ptr;
+	rd_kafka_topic_destroy(rkt);
+
 }
 
 
@@ -270,7 +306,7 @@ openKafka(wrkrInstanceData_t *const __restrict__ pWrkrData)
 	int nBrokers = 0;
 	DEFiRet;
 
-	if(pWrkrData->bIsOpen)
+	if(pWrkrData->pData->bIsOpen)
 		FINALIZE;
 
 	/* main conf */
@@ -300,60 +336,28 @@ openKafka(wrkrInstanceData_t *const __restrict__ pWrkrData)
 	rd_kafka_conf_set_dr_cb(conf, deliveryCallback);
 	rd_kafka_conf_set_error_cb(conf, errorCallback);
 
-	/* topic conf */
-	rd_kafka_topic_conf_t *const topicconf = rd_kafka_topic_conf_new();
-	if(topicconf == NULL) {
-		errmsg.LogError(0, RS_RET_KAFKA_ERROR,
-			"omkafka: error creating kafka topic conf obj: %s\n", 
-			rd_kafka_err2str(rd_kafka_errno2err(errno)));
-		ABORT_FINALIZE(RS_RET_KAFKA_ERROR);
-	}
-	for(int i = 0 ; i < pData->nTopicConfParams ; ++i) {
-		if(rd_kafka_topic_conf_set(topicconf,
-				     pData->topicConfParams[i].name, 
-				     pData->topicConfParams[i].val, 
-				     errstr, sizeof(errstr))
-	 	   != RD_KAFKA_CONF_OK) {
-			if(pWrkrData->bReportErrs) {
-				errmsg.LogError(0, RS_RET_PARAM_ERROR, "error in kafka "
-						"topic conf parameter '%s=%s': %s", 
-						pData->topicConfParams[i].name, 
-						pData->topicConfParams[i].val, errstr);
-			}
-			ABORT_FINALIZE(RS_RET_PARAM_ERROR);
-		}
-	} 
-
 	char kafkaErrMsg[1024];
-	pWrkrData->rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf,
+	pWrkrData->pData->rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf,
 				     kafkaErrMsg, sizeof(kafkaErrMsg));
-	if(pWrkrData->rk == NULL) {
+	if(pWrkrData->pData->rk == NULL) {
 		errmsg.LogError(0, RS_RET_KAFKA_ERROR,
 			"omkafka: error creating kafka handle: %s\n", kafkaErrMsg);
 		ABORT_FINALIZE(RS_RET_KAFKA_ERROR);
 	}
-	rd_kafka_set_logger(pWrkrData->rk, kafkaLogger);
-	if((nBrokers = rd_kafka_brokers_add(pWrkrData->rk, (char*)pData->brokers)) == 0) {
+	rd_kafka_set_logger(pWrkrData->pData->rk, kafkaLogger);
+	if((nBrokers = rd_kafka_brokers_add(pWrkrData->pData->rk, (char*)pData->brokers)) == 0) {
 		errmsg.LogError(0, RS_RET_KAFKA_NO_VALID_BROKERS,
 			"omkafka: no valid brokers specified: %s\n", pData->brokers);
 		ABORT_FINALIZE(RS_RET_KAFKA_NO_VALID_BROKERS);
 	}
 
-	pWrkrData->rkt = rd_kafka_topic_new(pWrkrData->rk, pData->topic, topicconf);
-	if(pWrkrData->rkt == NULL) {
-		errmsg.LogError(0, RS_RET_KAFKA_ERROR,
-			"omkafka: error creating kafka topic: %s\n", 
-			rd_kafka_err2str(rd_kafka_errno2err(errno)));
-		ABORT_FINALIZE(RS_RET_KAFKA_ERROR);
-	}
-
-	pWrkrData->bIsOpen = 1;
+	pWrkrData->pData->bIsOpen = 1;
 finalize_it:
 	if(iRet == RS_RET_OK) {
 		pWrkrData->bReportErrs = 1;
 	} else {
 		pWrkrData->bReportErrs = 0;
-		if(pWrkrData->rk != NULL) {
+		if(pWrkrData->pData->rk != NULL) {
 			do_rd_kafka_destroy(pWrkrData);
 		}
 	}
@@ -363,14 +367,17 @@ finalize_it:
 BEGINcreateInstance
 CODESTARTcreateInstance
 	pData->currPartition = 0;
+	pData->bIsOpen = 0;
 	pData->fdErrFile = -1;
 	pthread_mutex_init(&pData->mutErrFile, NULL);
+	CHKmalloc(pData->topics = create_hashtable(50, hash_from_string, key_equals_string,
+											topicHashDestruct));
+	finalize_it:
 ENDcreateInstance
 
 
 BEGINcreateWrkrInstance
 CODESTARTcreateWrkrInstance
-	pWrkrData->bIsOpen = 0;
 	pWrkrData->bReportErrs = 1;
 ENDcreateWrkrInstance
 
@@ -397,6 +404,8 @@ CODESTARTfreeInstance
 	if(pData->fdErrFile != -1)
 		close(pData->fdErrFile);
 	pthread_mutex_destroy(&pData->mutErrFile);
+	if(pData->topics != NULL)
+		hashtable_destroy(pData->topics, 1);
 ENDfreeInstance
 
 BEGINfreeWrkrInstance
@@ -432,26 +441,76 @@ ENDtryResume
 
 
 static rsRetVal
-writeKafka(wrkrInstanceData_t *pWrkrData, uchar *msg)
+writeKafka(wrkrInstanceData_t *pWrkrData, uchar *msg, uchar *topic)
 {
 	DEFiRet;
 	const int partition = getPartition(pWrkrData->pData);
+	char errstr[MAX_ERRMSG];
+	rd_kafka_topic_t *rkt = NULL;
+	uchar *hashtopic;
+	int r;
 
 	DBGPRINTF("omkafka: trying to send: '%s'\n", msg);
 	CHKiRet(openKafka(pWrkrData));
-	if(rd_kafka_produce(pWrkrData->rkt, partition, RD_KAFKA_MSG_F_COPY,
+
+	/* search hashtable for topic */
+	rkt = hashtable_search(pWrkrData->pData->topics, topic);
+
+	/* If no topic is found, lets create a new one with a config.
+	 * We cannot rely on librdkafka to give us a topic without leaking
+	 * memory if the topic already exists.
+	 */
+
+	if (rkt == NULL) {
+		/* topic conf */
+		rd_kafka_topic_conf_t *const topicconf = rd_kafka_topic_conf_new();
+		if(topicconf == NULL) {
+			errmsg.LogError(0, RS_RET_KAFKA_ERROR,
+				"omkafka: error creating kafka topic conf obj: %s\n",
+				rd_kafka_err2str(rd_kafka_errno2err(errno)));
+			ABORT_FINALIZE(RS_RET_KAFKA_ERROR);
+		}
+		for(int i = 0 ; i < pWrkrData->pData->nTopicConfParams ; ++i) {
+			if(rd_kafka_topic_conf_set(topicconf,
+					     pWrkrData->pData->topicConfParams[i].name,
+					     pWrkrData->pData->topicConfParams[i].val,
+					     errstr, sizeof(errstr))
+			!= RD_KAFKA_CONF_OK) {
+				if(pWrkrData->bReportErrs) {
+					errmsg.LogError(0, RS_RET_PARAM_ERROR, "error in kafka "
+							"topic conf parameter '%s=%s': %s",
+							pWrkrData->pData->topicConfParams[i].name,
+							pWrkrData->pData->topicConfParams[i].val, errstr);
+				}
+				ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+			}
+		}
+		rkt = rd_kafka_topic_new(pWrkrData->pData->rk, (char *)topic, topicconf);
+		if(rkt == NULL) {
+			errmsg.LogError(0, RS_RET_KAFKA_ERROR,
+				"omkafka: error creating kafka topic: %s\n", 
+				rd_kafka_err2str(rd_kafka_errno2err(errno)));
+			ABORT_FINALIZE(RS_RET_KAFKA_ERROR);
+		}
+		CHKmalloc(hashtopic = ustrdup(topic));
+		r = hashtable_insert(pWrkrData->pData->topics, hashtopic, rkt);
+		if(r == 0)
+			ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+	}
+	if(rd_kafka_produce(rkt, partition, RD_KAFKA_MSG_F_COPY,
 	                    msg, strlen((char*)msg), NULL, 0, NULL) == -1) {
 		errmsg.LogError(0, RS_RET_KAFKA_PRODUCE_ERR,
 			"omkafka: Failed to produce to topic '%s' "
 			"partition %d: %s\n",
-			rd_kafka_topic_name(pWrkrData->rkt), partition, 
+			rd_kafka_topic_name(rkt), partition,
 			rd_kafka_err2str(rd_kafka_errno2err(errno)));
+		STATSCOUNTER_INC(kafkaFail, mutCtrKafkaFail);
 		ABORT_FINALIZE(RS_RET_KAFKA_PRODUCE_ERR);
 	}
-	const int callbacksCalled = rd_kafka_poll(pWrkrData->rk, 0); /* call callbacks */
+	const int callbacksCalled = rd_kafka_poll(pWrkrData->pData->rk, 0); /* call callbacks */
 
 	DBGPRINTF("omkafka: kafka outqueue length: %d, callbacks called %d\n",
-		  rd_kafka_outq_len(pWrkrData->rk), callbacksCalled);
+		  rd_kafka_outq_len(pWrkrData->pData->rk), callbacksCalled);
 
 finalize_it:
 	DBGPRINTF("omkafka: writeKafka returned %d\n", iRet);
@@ -459,13 +518,18 @@ finalize_it:
 		closeKafka(pWrkrData);
 		iRet = RS_RET_SUSPENDED;
 	}
+	STATSCOUNTER_INC(topicSubmit, mutCtrTopicSubmit);
 	RETiRet;
 }
 
 
 BEGINdoAction
 CODESTARTdoAction
-	iRet = writeKafka(pWrkrData, ppString[0]);
+	/* Support dynamic topic */
+	if (pWrkrData->pData->dynTopic)
+		iRet = writeKafka(pWrkrData, ppString[0], ppString[1]);
+	else
+		iRet = writeKafka(pWrkrData, ppString[0], pWrkrData->pData->topic);
 ENDdoAction
 
 
@@ -473,6 +537,7 @@ static inline void
 setInstParamDefaults(instanceData *pData)
 {
 	pData->topic = NULL;
+	pData->dynTopic = 0;
 	pData->brokers = NULL;
 	pData->fixedPartition = NO_FIXED_PARTITION;
 	pData->nPartitions = 1;
@@ -506,6 +571,7 @@ finalize_it:
 BEGINnewActInst
 	struct cnfparamvals *pvals;
 	int i;
+	int iNumTpls;
 CODESTARTnewActInst
 	if((pvals = nvlstGetParams(lst, &actpblk, NULL)) == NULL) {
 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
@@ -514,12 +580,13 @@ CODESTARTnewActInst
 	CHKiRet(createInstance(&pData));
 	setInstParamDefaults(pData);
 
-	CODE_STD_STRING_REQUESTnewActInst(1)
 	for(i = 0 ; i < actpblk.nParams ; ++i) {
 		if(!pvals[i].bUsed)
 			continue;
 		if(!strcmp(actpblk.descr[i].name, "topic")) {
-			pData->topic = es_str2cstr(pvals[i].val.d.estr, NULL);
+			pData->topic = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(actpblk.descr[i].name, "dyntopic")) {
+			pData->dynTopic = pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "partitions.number")) {
 			pData->nPartitions = pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "partitions.usefixed")) {
@@ -567,9 +634,23 @@ CODESTARTnewActInst
 	if(pData->brokers == NULL)
 		CHKmalloc(pData->brokers = strdup("localhost:9092"));
 
+	if(pData->dynTopic && pData->topic == NULL) {
+        errmsg.LogError(0, RS_RET_CONFIG_ERROR,
+            "omkafka: requested dynamic topic, but no "
+            "name for topic template given - action definition invalid");
+        ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+	}
+
+	iNumTpls = 1;
+	if(pData->dynTopic) ++iNumTpls;
+	CODE_STD_STRING_REQUESTnewActInst(iNumTpls);
 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)strdup((pData->tplName == NULL) ? 
 						"RSYSLOG_FileFormat" : (char*)pData->tplName),
 						OMSR_NO_RQD_TPL_OPTS));
+	if(pData->dynTopic) {
+        CHKiRet(OMSRsetEntry(*ppOMSR, 1, ustrdup(pData->topic),
+            OMSR_NO_RQD_TPL_OPTS));
+	}
 CODE_STD_FINALIZERnewActInst
 	cnfparamvalsDestruct(pvals, &actpblk);
 ENDnewActInst
@@ -591,7 +672,9 @@ ENDparseSelectorAct
 
 BEGINmodExit
 CODESTARTmodExit
+	statsobj.Destruct(&kafkaStats);
 	CHKiRet(objRelease(errmsg, CORE_COMPONENT));
+	CHKiRet(objRelease(statsobj, CORE_COMPONENT));
 finalize_it:
 ENDmodExit
 
@@ -612,7 +695,17 @@ INITLegCnfVars
 	*ipIFVersProvided = CURR_MOD_IF_VERSION;
 CODEmodInit_QueryRegCFSLineHdlr
 	CHKiRet(objUse(errmsg, CORE_COMPONENT));
+	CHKiRet(objUse(statsobj, CORE_COMPONENT));
 	DBGPRINTF("omkafka %s using librdkafka version %s\n",
 	          VERSION, rd_kafka_version_str());
+	CHKiRet(statsobj.Construct(&kafkaStats));
+	CHKiRet(statsobj.SetName(kafkaStats, (uchar *)"omkafka"));
+	STATSCOUNTER_INIT(topicSubmit, mutCtrTopicSubmit);
+	CHKiRet(statsobj.AddCounter(kafkaStats, (uchar *)"submitted",
+		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &topicSubmit));
+	STATSCOUNTER_INIT(kafkaFail, mutCtrKafkaFail);
+	CHKiRet(statsobj.AddCounter(kafkaStats, (uchar *)"failures",
+		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &kafkaFail));
+	CHKiRet(statsobj.ConstructFinalize(kafkaStats));
 CODEmodInit_QueryRegCFSLineHdlr
 ENDmodInit
