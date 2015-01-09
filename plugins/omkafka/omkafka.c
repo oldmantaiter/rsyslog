@@ -39,8 +39,6 @@
 #include "errmsg.h"
 #include "atomic.h"
 #include "statsobj.h"
-#include "hashtable.h"
-#include "hashtable_itr.h"
 #include "unicode-helper.h"
 
 MODULE_TYPE_OUTPUT
@@ -54,8 +52,11 @@ DEFobjCurrIf(errmsg)
 DEFobjCurrIf(statsobj)
 
 statsobj_t *kafkaStats;
-STATSCOUNTER_DEF(topicSubmit, mutCtrTopicSubmit)
-STATSCOUNTER_DEF(kafkaFail, mutCtrKafkaFail)
+STATSCOUNTER_DEF(ctrTopicSubmit, mutCtrTopicSubmit);
+STATSCOUNTER_DEF(ctrKafkaFail, mutCtrKafkaFail);
+STATSCOUNTER_DEF(ctrCacheMiss, mutCtrCacheMiss);
+STATSCOUNTER_DEF(ctrCacheEvict, mutCtrCacheEvict);
+STATSCOUNTER_DEF(ctrCacheSkip, mutCtrCacheSkip);
 
 #define MAX_ERRMSG 1024 /* max size of error messages that we support */
 
@@ -66,9 +67,41 @@ struct kafka_params {
 	const char *val;
 };
 
+#if HAVE_ATOMIC_BUILTINS64
+static uint64 clockTopicAccess = 0;
+#else
+static unsigned clockTopicAccess = 0;
+#endif
+/* and the "tick" function */
+#ifndef HAVE_ATOMIC_BUILTINS
+static pthread_mutex_t mutClock;
+#endif
+static inline uint64
+getClockTopicAccess(void)
+{
+#if HAVE_ATOMIC_BUILTINS64
+	return ATOMIC_INC_AND_FETCH_uint64(&clockTopicAccess, &mutClock);
+#else
+	return ATOMIC_INC_AND_FETCH_unsigned(&clockTopicAccess, &mutClock);
+#endif
+}
+
+struct s_dynaTopicCacheEntry {
+	uchar *pName;
+	rd_kafka_topic_t *pTopic;
+	uint64 clkTickAccessed;
+	short nInactive;
+};
+typedef struct s_dynaTopicCacheEntry dynaTopicCacheEntry;
+
 typedef struct _instanceData {
 	uchar *topic;
-	sbool dynTopic;
+	sbool dynaTopic;
+	dynaTopicCacheEntry **dynCache;
+	rd_kafka_topic_t *pTopic;
+	int iCurrElt;
+	int iCurrCacheSize;
+	int iDynaTopicCacheSize;
 	uchar *tplName;		/* assigned output template */
 	char *brokers;
 	int fixedPartition;
@@ -80,7 +113,6 @@ typedef struct _instanceData {
 	struct kafka_params *topicConfParams;
 	uchar *errorFile;
 	int fdErrFile;		/* error file fd or -1 if not open */
-	struct hashtable *topics;
 	pthread_mutex_t mutErrFile;
 	int bIsOpen;
 	rd_kafka_t *rk;
@@ -96,7 +128,8 @@ typedef struct wrkrInstanceData {
 /* action (instance) parameters */
 static struct cnfparamdescr actpdescr[] = {
 	{ "topic", eCmdHdlrString, CNFPARAM_REQUIRED },
-	{ "dyntopic", eCmdHdlrBinary, 0 },
+	{ "dynatopic", eCmdHdlrBinary, 0 },
+	{ "dynatopic.cachesize", eCmdHdlrInt, 0 },
 	{ "partitions.number", eCmdHdlrPositiveInt, 0 },
 	{ "partitions.usefixed", eCmdHdlrNonNegInt, 0 }, /* expert parameter, "nails" partition */
 	{ "broker", eCmdHdlrArray, 0 },
@@ -125,27 +158,226 @@ getPartition(instanceData *const __restrict__ pData)
 }
 
 BEGINdoHUP
-	rd_kafka_topic_t *rkt;
-	struct hashtable_itr *itr;
 CODESTARTdoHUP
 	pthread_mutex_lock(&pData->mutErrFile);
 	if(pData->fdErrFile != -1) {
 		close(pData->fdErrFile);
 		pData->fdErrFile = -1;
 	}
-	pthread_mutex_unlock(&pData->mutErrFile);
-	/* Iterate through hashtable and remove objects */
-	itr = hashtable_iterator(pData->topics);
-	if(hashtable_count(pData->topics) > 0)
-	{
-		do {
-			rkt = (rd_kafka_topic_t *) hashtable_iterator_value(itr);
-			rd_kafka_topic_destroy(rkt);
-			DBGPRINTF("omkafka: HUP, closing topic %s\n", rd_kafka_topic_name(rkt));
-		} while (hashtable_iterator_remove(itr));
+	if(pData->dynaTopic) {
+		dynaTopicFreeCacheEntries(pData);
+	} else {
+		closeTopic(pData);
 	}
+	pthread_mutex_unlock(&pData->mutErrFile);
 ENDdoHUP
 
+/* These dynaTopic* functions are only slightly modified versions of those found in omfile.c */
+
+static rsRetVal
+dynaTopicDelCacheEntry(instanceData *__restrict__ const pData, const int iEntry, const int bFreeEntry)
+{
+	dynaTopicCacheEntry **pCache = pData->dynCache;
+	DEFiRet;
+	ASSERT(pCache != NULL);
+
+	if(pCache[iEntry] == NULL)
+		FINALIZE;
+
+	DBGPRINTF("Removing entry %d for topic '%s' from dynaCache.\n", iEntry,
+		pCache[iEntry]->pName == NULL ? UCHAR_CONSTANT("[OPEN FAILED]") : pCache[iEntry]->pName);
+
+	if(pCache[iEntry]->pName != NULL) {
+		d_free(pCache[iEntry]->pName);
+		pCache[iEntry]->pName = NULL;
+	}
+
+	if(bFreeEntry) {
+		d_free(pCache[iEntry]);
+		pCache[iEntry] = NULL;
+	}
+
+finalize_it:
+	RETiRet;
+}
+
+static inline void
+dynaTopicFreeCacheEntries(instanceData *__restrict__ const pData)
+{
+	register int i;
+	ASSERT(pData != NULL);
+
+	BEGINfunc;
+	for(i = 0 ; i < pData->iCurrCacheSize ; ++i) {
+		dynaTopicDelCacheEntry(pData, i, 1);
+	}
+	pData->iCurrElt = -1; /* invalidate current element */
+	ENDfunc;
+}
+
+static void dynaTopicFreeCache(instanceData *__restrict__ const pData)
+{
+	ASSERT(pData != NULL);
+
+	BEGINfunc;
+	dynaTopicFreeCacheEntries(pData);
+	if(pData->dynCache != NULL)
+		d_free(pData->dynCache);
+	ENDfunc;
+}
+
+static inline rsRetVal
+prepareDynTopic(instanceData *__restrict__ const pData, const uchar *__restrict__ const newTopicName)
+{
+	uint64 ctOldest;
+	int iOldest;
+	int i;
+	int iFirstFree;
+	rsRetVal localRet;
+	dynaTopicCacheEntry **pCache;
+	DEFiRet;
+
+	ASSERT(pData != NULL);
+	ASSERT(newTopicName != NULL);
+
+	pCache = pData->dynCache;
+
+	/* first check, if we still have the current topic */
+	if ((pData->iCurrElt != -1)
+		&& !ustrcmp(newTopicName, pCache[pData->iCurrElt]->pName)) {
+			/* great, we are all set */
+			pCache[pData->iCurrElt]->clkTickAccessed = getClockTopicAccess();
+			STATSCOUNTER_INC(ctrCacheSkip, mutCtrCacheSkip);
+			FINALIZE;
+	}
+
+	/* ok, no luck. Now let's search the table if we find a matching spot.
+	 * While doing so, we also prepare for creation of a new one.
+	 */
+	pData->iCurrElt = -1;
+	iFirstFree = -1;
+	iOldest = 0;
+	ctOldest = getClockTopicAccess();
+	for(i = 0 ; i < pData->iCurrCacheSize ; ++i) {
+		if(pCache[i] == NULL || pCache[i]->pName == NULL) {
+			if(iFirstFree == -1)
+				iFirstFree = i;
+		} else { /*got an element, let's see if it matches */
+			if(!ustrcmp(newTopicName, pCache[i]->pName)) {
+				/* we found our element! */
+				pData->pTopic = pCache[i]->pTopic;
+				pData->iCurrElt = i;
+				pCache[i]->clkTickAccessed = getClockTopicAccess(); /* update "timestamp" for LRU */
+				FINALIZE;
+			}
+			/* did not find it - so lets keep track of the counters for LRU */
+			if(pCache[i]->clkTickAccessed < ctOldest) {
+				ctOldest = pCache[i]->clkTickAccessed;
+				iOldest = i;
+			}
+		}
+	}
+	STATSCOUNTER_INC(ctrCacheMiss, mutCtrCacheMiss);
+
+	/* invalidate iCurrElt as we may error-exit out of this function when the currrent
+	 * iCurrElt has been freed or otherwise become unusable. This is a precaution, and
+	 * performance-wise it may be better to do that in each of the exits. However, that
+	 * is error-prone, so I prefer to do it here. -- rgerhards, 2010-03-02
+	 */
+	pData->iCurrElt = -1;
+
+	/* similarly, we need to set the current pTopic to NULL, because otherwise, if prepareTopic() fails,
+	 * we may end up using an old topic. This bug depends on how exactly prepareTopic fails,
+	 * but it could be triggered in the common case of a failed open() system call.
+	 * rgerhards, 2010-03-22
+	 */
+	pData->pTopic = NULL;
+
+	if(iFirstFree == -1 && (pData->iCurrCacheSize < pData->iDynaTopicCacheSize)) {
+		/* there is space left, so set it to that index */
+		iFirstFree = pData->iCurrCacheSize++;
+	}
+
+	if(iFirstFree == -1) {
+		dynaTopicDelCacheEntry(pData, iOldest, 0);
+		STATSCOUNTER_INC(ctrCacheEvict, mutCtrCacheEvict);
+		iFirstFree = iOldest; /* this one *is* now free ;) */
+	} else {
+		/* we need to allocate memory for the cache structure */
+		CHKmalloc(pCache[iFirstFree] = (dynaTopicCacheEntry*) calloc(1, sizeof(dynaTopicCacheEntry)));
+	}
+
+	/* Ok, we finally can open the topic */
+	localRet = prepareTopic(pData, newTopicName);
+
+	if(localRet != RS_RET_OK) {
+		errmsg.LogError(0, localRet, "Could not open dynamic topic '%s' [state %d] - discarding message", newTopicName, localRet);
+		ABORT_FINALIZE(localRet);
+	}
+
+	if((pCache[iFirstFree]->pName = ustrdup(newTopicName)) == NULL) {
+		closeTopic(pData);
+		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+	}
+	pCache[iFirstFree]->pTopic = pData->pTopic;
+	pCache[iFirstFree]->clkTickAccessed = getClockTopicAccess();
+	pData->iCurrElt = iFirstFree;
+	DBGPRINTF("Added new entry %d for topic cache, topic '%s'.\n", iFirstFree, newTopicName);
+
+finalize_it:
+	pCache[pData->iCurrElt]->nInactive = 0;
+	RETiRet;
+}
+
+static rsRetVal
+prepareTopic(instanceData *__restrict__ const pData, const uchar *__restrict__ const newTopicName)
+{
+	/* Get a new topic conf */
+	rd_kafka_topic_conf_t *const topicconf = rd_kafka_topic_conf_new();
+	char errstr[MAX_ERRMSG];
+	rd_kafka_topic_t *rkt = NULL;
+	DEFiRet;
+
+	pData->pTopic = NULL;
+
+	if(topicconf == NULL) {
+		errmsg.LogError(0, RS_RET_KAFKA_ERROR,
+			"omkafka: error creating kafka topic conf obj: %s\n",
+			rd_kafka_err2str(rd_kafka_errno2err(errno)));
+		ABORT_FINALIZE(RS_RET_KAFKA_ERROR);
+	}
+	for(int i = 0 ; i < pWrkrData->pData->nTopicConfParams ; ++i) {
+		if(rd_kafka_topic_conf_set(topicconf,
+				     pWrkrData->pData->topicConfParams[i].name,
+				     pWrkrData->pData->topicConfParams[i].val,
+				     errstr, sizeof(errstr))
+		!= RD_KAFKA_CONF_OK) {
+			if(pWrkrData->bReportErrs) {
+				errmsg.LogError(0, RS_RET_PARAM_ERROR, "error in kafka "
+						"topic conf parameter '%s=%s': %s",
+						pWrkrData->pData->topicConfParams[i].name,
+						pWrkrData->pData->topicConfParams[i].val, errstr);
+			}
+			ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+		}
+	}
+	rkt = rd_kafka_topic_new(pWrkrData->pData->rk, (char *)newTopicName, topicconf);
+	if(rkt == NULL) {
+		errmsg.LogError(0, RS_RET_KAFKA_ERROR,
+			"omkafka: error creating kafka topic: %s\n", 
+			rd_kafka_err2str(rd_kafka_errno2err(errno)));
+		ABORT_FINALIZE(RS_RET_KAFKA_ERROR);
+	}
+	pData->pTopic = rkt;
+
+finalize_it:
+	if(iRet != RS_RET_OK) {
+		if(pData->pTopic != NULL) {
+			closeTopic(pData);
+		}
+	}
+	RETiRet;
+}
 
 /* write data error request/replies to separate error file
  * Note: we open the file but never close it before exit. If it
@@ -269,12 +501,14 @@ errorCallback(rd_kafka_t __attribute__((unused)) *rk,
 		"omkafka: kafka message %s", reason);
 }
 
-/* destroy hashtable item */
-static void
-topicHashDestruct(void *ptr)
+/* destroy topic item */
+static rsRetVal
+closeTopic(instanceData *__restrict__ const pData)
 {
-	rd_kafka_topic_t *rkt = (rd_kafka_topic_t*) ptr;
-	rd_kafka_topic_destroy(rkt);
+	DEFiRet;
+	DBGPRINTF("omkafka: closing topic %s\n", rd_kafka_topic_name(pData->pTopic));
+	rd_kafka_topic_destroy(pData->pTopic);
+	RETiRet;
 
 }
 
@@ -369,9 +603,8 @@ CODESTARTcreateInstance
 	pData->currPartition = 0;
 	pData->bIsOpen = 0;
 	pData->fdErrFile = -1;
+	pData->pTopic = NULL;
 	pthread_mutex_init(&pData->mutErrFile, NULL);
-	CHKmalloc(pData->topics = create_hashtable(50, hash_from_string, key_equals_string,
-											topicHashDestruct));
 	finalize_it:
 ENDcreateInstance
 
@@ -403,9 +636,12 @@ CODESTARTfreeInstance
 	}
 	if(pData->fdErrFile != -1)
 		close(pData->fdErrFile);
+	if(pData->dynaTopic) {
+		dynaTopicFreeCache(pData)
+	} else if(pData->pTopic != NULL) {
+		closeTopic(pData);
+	}
 	pthread_mutex_destroy(&pData->mutErrFile);
-	if(pData->topics != NULL)
-		hashtable_destroy(pData->topics, 1);
 ENDfreeInstance
 
 BEGINfreeWrkrInstance
@@ -445,57 +681,25 @@ writeKafka(wrkrInstanceData_t *pWrkrData, uchar *msg, uchar *topic)
 {
 	DEFiRet;
 	const int partition = getPartition(pWrkrData->pData);
-	char errstr[MAX_ERRMSG];
-	rd_kafka_topic_t *rkt = NULL;
 	uchar *hashtopic;
 	int r;
 
 	DBGPRINTF("omkafka: trying to send: '%s'\n", msg);
 	CHKiRet(openKafka(pWrkrData));
 
-	/* search hashtable for topic */
-	rkt = hashtable_search(pWrkrData->pData->topics, topic);
-
-	/* If no topic is found, lets create a new one with a config.
-	 * We cannot rely on librdkafka to give us a topic without leaking
-	 * memory if the topic already exists.
-	 */
-
-	if (rkt == NULL) {
-		/* topic conf */
-		rd_kafka_topic_conf_t *const topicconf = rd_kafka_topic_conf_new();
-		if(topicconf == NULL) {
-			errmsg.LogError(0, RS_RET_KAFKA_ERROR,
-				"omkafka: error creating kafka topic conf obj: %s\n",
-				rd_kafka_err2str(rd_kafka_errno2err(errno)));
-			ABORT_FINALIZE(RS_RET_KAFKA_ERROR);
-		}
-		for(int i = 0 ; i < pWrkrData->pData->nTopicConfParams ; ++i) {
-			if(rd_kafka_topic_conf_set(topicconf,
-					     pWrkrData->pData->topicConfParams[i].name,
-					     pWrkrData->pData->topicConfParams[i].val,
-					     errstr, sizeof(errstr))
-			!= RD_KAFKA_CONF_OK) {
-				if(pWrkrData->bReportErrs) {
-					errmsg.LogError(0, RS_RET_PARAM_ERROR, "error in kafka "
-							"topic conf parameter '%s=%s': %s",
-							pWrkrData->pData->topicConfParams[i].name,
-							pWrkrData->pData->topicConfParams[i].val, errstr);
-				}
-				ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+	/* check if we are using dynamic topic names */
+	if(pWrkrData->pData->dynaTopic) {
+		DBGPRINTF("omkafka: topic to insert to: %s\n", topic);
+		CHKiRet(prepareDynTopic(pWrkrData->pData, topic));
+	} else {
+		if(pData->pTopic == NULL) {
+			CHKiRet(prepareTopic(pData, topic));
+			if(pData->pTopic == NULL) {
+				errmsg.LogError(0, RS_RET_KAFKA_PRODUCE_ERR,
+					"Could not open topic '%s'", topic);
 			}
 		}
-		rkt = rd_kafka_topic_new(pWrkrData->pData->rk, (char *)topic, topicconf);
-		if(rkt == NULL) {
-			errmsg.LogError(0, RS_RET_KAFKA_ERROR,
-				"omkafka: error creating kafka topic: %s\n", 
-				rd_kafka_err2str(rd_kafka_errno2err(errno)));
-			ABORT_FINALIZE(RS_RET_KAFKA_ERROR);
-		}
-		CHKmalloc(hashtopic = ustrdup(topic));
-		r = hashtable_insert(pWrkrData->pData->topics, hashtopic, rkt);
-		if(r == 0)
-			ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+		pData->nInactive = 0;
 	}
 	if(rd_kafka_produce(rkt, partition, RD_KAFKA_MSG_F_COPY,
 	                    msg, strlen((char*)msg), NULL, 0, NULL) == -1) {
@@ -504,7 +708,7 @@ writeKafka(wrkrInstanceData_t *pWrkrData, uchar *msg, uchar *topic)
 			"partition %d: %s\n",
 			rd_kafka_topic_name(rkt), partition,
 			rd_kafka_err2str(rd_kafka_errno2err(errno)));
-		STATSCOUNTER_INC(kafkaFail, mutCtrKafkaFail);
+		STATSCOUNTER_INC(ctrKafkaFail, mutCtrKafkaFail);
 		ABORT_FINALIZE(RS_RET_KAFKA_PRODUCE_ERR);
 	}
 	const int callbacksCalled = rd_kafka_poll(pWrkrData->pData->rk, 0); /* call callbacks */
@@ -518,7 +722,7 @@ finalize_it:
 		closeKafka(pWrkrData);
 		iRet = RS_RET_SUSPENDED;
 	}
-	STATSCOUNTER_INC(topicSubmit, mutCtrTopicSubmit);
+	STATSCOUNTER_INC(ctrTopicSubmit, mutCtrTopicSubmit);
 	RETiRet;
 }
 
@@ -526,7 +730,7 @@ finalize_it:
 BEGINdoAction
 CODESTARTdoAction
 	/* Support dynamic topic */
-	if (pWrkrData->pData->dynTopic)
+	if (pWrkrData->pData->dynaTopic)
 		iRet = writeKafka(pWrkrData, ppString[0], ppString[1]);
 	else
 		iRet = writeKafka(pWrkrData, ppString[0], pWrkrData->pData->topic);
@@ -537,7 +741,8 @@ static inline void
 setInstParamDefaults(instanceData *pData)
 {
 	pData->topic = NULL;
-	pData->dynTopic = 0;
+	pData->dynaTopic = 0;
+	pData->iDynaTopicCacheSize = 50;
 	pData->brokers = NULL;
 	pData->fixedPartition = NO_FIXED_PARTITION;
 	pData->nPartitions = 1;
@@ -585,8 +790,10 @@ CODESTARTnewActInst
 			continue;
 		if(!strcmp(actpblk.descr[i].name, "topic")) {
 			pData->topic = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "dyntopic")) {
-			pData->dynTopic = pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, "dynatopic")) {
+			pData->dynaTopic = pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, "dynatopic.cachesize")) {
+			pData->iDynaTopicCacheSize = pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "partitions.number")) {
 			pData->nPartitions = pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "partitions.usefixed")) {
@@ -634,7 +841,7 @@ CODESTARTnewActInst
 	if(pData->brokers == NULL)
 		CHKmalloc(pData->brokers = strdup("localhost:9092"));
 
-	if(pData->dynTopic && pData->topic == NULL) {
+	if(pData->dynaTopic && pData->topic == NULL) {
         errmsg.LogError(0, RS_RET_CONFIG_ERROR,
             "omkafka: requested dynamic topic, but no "
             "name for topic template given - action definition invalid");
@@ -642,14 +849,16 @@ CODESTARTnewActInst
 	}
 
 	iNumTpls = 1;
-	if(pData->dynTopic) ++iNumTpls;
+	if(pData->dynaTopic) ++iNumTpls;
 	CODE_STD_STRING_REQUESTnewActInst(iNumTpls);
 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)strdup((pData->tplName == NULL) ? 
 						"RSYSLOG_FileFormat" : (char*)pData->tplName),
 						OMSR_NO_RQD_TPL_OPTS));
-	if(pData->dynTopic) {
+	if(pData->dynaTopic) {
         CHKiRet(OMSRsetEntry(*ppOMSR, 1, ustrdup(pData->topic),
             OMSR_NO_RQD_TPL_OPTS));
+        CHKmalloc(pData->dynCache = (dynaTopicCacheEntry**)
+			calloc(pData->iDynaTopicCacheSize, sizeof(dynaTopicCacheEntry*)));
 	}
 CODE_STD_FINALIZERnewActInst
 	cnfparamvalsDestruct(pvals, &actpblk);
@@ -700,12 +909,21 @@ CODEmodInit_QueryRegCFSLineHdlr
 	          VERSION, rd_kafka_version_str());
 	CHKiRet(statsobj.Construct(&kafkaStats));
 	CHKiRet(statsobj.SetName(kafkaStats, (uchar *)"omkafka"));
-	STATSCOUNTER_INIT(topicSubmit, mutCtrTopicSubmit);
+	STATSCOUNTER_INIT(ctrTopicSubmit, mutCtrTopicSubmit);
 	CHKiRet(statsobj.AddCounter(kafkaStats, (uchar *)"submitted",
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &topicSubmit));
-	STATSCOUNTER_INIT(kafkaFail, mutCtrKafkaFail);
+		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &ctrTopicSubmit));
+	STATSCOUNTER_INIT(ctrKafkaFail, mutCtrKafkaFail);
 	CHKiRet(statsobj.AddCounter(kafkaStats, (uchar *)"failures",
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &kafkaFail));
+		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &ctrKafkaFail));
+	STATSCOUNTER_INIT(ctrCacheSkip, mutCtrCacheSkip);
+	CHKiRet(statsobj.AddCounter(kafkaStats, (uchar *)"topicdynacache.skipped",
+		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &ctrCacheSkip));
+	STATSCOUNTER_INIT(ctrCacheMiss, mutCtrCacheMiss);
+	CHKiRet(statsobj.AddCounter(kafkaStats, (uchar *)"topicdynacache.miss",
+		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &ctrCacheMiss));
+	STATSCOUNTER_INIT(ctrCacheEvict, mutCtrCacheEvict);
+	CHKiRet(statsobj.AddCounter(kafkaStats, (uchar *)"topicdynacache.evicted",
+		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &ctrCacheEvict));
 	CHKiRet(statsobj.ConstructFinalize(kafkaStats));
 CODEmodInit_QueryRegCFSLineHdlr
 ENDmodInit
